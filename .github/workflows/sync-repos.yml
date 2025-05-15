@@ -33,6 +33,8 @@ env:
   DEFAULT_SOURCE_BRANCH: "master"
   DEFAULT_DESTINATION_BRANCH: "airbyte-sync"
   DEFAULT_PR_TITLE: "Weekly sync from Airbyte with history"
+  # Track Airbyte's history in a separate branch
+  AIRBYTE_TRACKING_BRANCH: "airbyte-source-history"
 
 jobs:
   repo-sync:
@@ -66,92 +68,47 @@ jobs:
           git config --global user.name 'romario'
           git config --global user.email 'actions@github.com'
 
-      - name: Create new branch for synced changes
+      - name: Add Airbyte repository as remote
         run: |
-          # Create a new branch from current default branch
-          git checkout -b ${{ env.DESTINATION_BRANCH }}
-
-      - name: Add Airbyte repository as remote and rebase
-        id: rebase
-        run: |
-          # Configure git for non-interactive rebase
-          git config --global core.editor "true"
-
           # Add Airbyte repository as remote
-          git remote add original https://github.com/${{ env.SOURCE_REPO }}.git
+          git remote add airbyte https://github.com/${{ env.SOURCE_REPO }}.git
+          git fetch airbyte ${{ env.SOURCE_BRANCH }}
 
-          # Fetch source repository
-          git fetch original ${{ env.SOURCE_BRANCH }}
-
-          # Create a temporary script to handle the rebase process
-          cat > /tmp/rebase-script.sh << 'EOF'
-          #!/bin/bash
-          set -e
-
-          # Start the rebase
-          git rebase original/$SOURCE_BRANCH -X theirs || true
-
-          # Check if we're in rebase mode
-          while git status | grep -q "You are currently rebasing"; do
-            # Handle conflicts due to deleted files
-            if git status | grep -q "deleted by\|deleted in"; then
-              # Remove files that were deleted in the source repo but modified in our repo
-              git status | grep "deleted by" | awk '{print $4}' | xargs -r git rm
-              # Remove files that were deleted in our repo but modified in the source repo
-              git status | grep "deleted in" | awk '{print $6}' | xargs -r git rm
-              # Remove files with rename/delete conflicts
-              git status | grep "renamed to" | grep "deleted in" | awk '{print $4}' | xargs -r git rm
-              # Remove any remaining conflicting files, except those in .github/workflows
-              git status | grep "both modified" | awk '{print $3}' | grep -v "\.github/workflows/" | xargs -r git checkout --theirs
-
-              # Stage all changes
-              git add .
-              
-              # Continue the rebase with an automatic commit message
-              GIT_EDITOR=true git rebase --continue || true
-            else
-              # For other conflicts, choose "theirs" strategy, except for .github/workflows
-              git status | grep "both modified" | awk '{print $3}' | grep -v "\.github/workflows/" | xargs -r git checkout --theirs
-              git add .
-              GIT_EDITOR=true git rebase --continue || true
-            fi
-            
-            # Check if rebase is still in progress
-            if ! git status | grep -q "You are currently rebasing"; then
-              break
-            fi
-          done
-
-          # Check final status
-          if git status | grep -q "You are currently rebasing"; then
-            echo "REBASE_SUCCESS=false" >> $GITHUB_ENV
-            exit 1
-          else
-            echo "REBASE_SUCCESS=true" >> $GITHUB_ENV
-            exit 0
-          fi
-          EOF
-
-          # Make the script executable
-          chmod +x /tmp/rebase-script.sh
-
-          # Run the rebase script
-          if /tmp/rebase-script.sh; then
-            echo "Rebase completed successfully."
-            echo "REBASE_SUCCESS=true" >> $GITHUB_ENV
-          else
-            echo "There are still unresolved conflicts after automatic fixes."
-            echo "REBASE_SUCCESS=false" >> $GITHUB_ENV
-            git rebase --abort
-          fi
-
-      - name: Push changes
-        if: env.REBASE_SUCCESS == 'true'
+      - name: Update Airbyte tracking branch
         run: |
+          # Check if tracking branch exists, create it if not
+          if git show-ref --verify --quiet refs/heads/${{ env.AIRBYTE_TRACKING_BRANCH }}; then
+            git checkout ${{ env.AIRBYTE_TRACKING_BRANCH }}
+          else
+            # Create orphan branch to track Airbyte's history separately
+            git checkout --orphan ${{ env.AIRBYTE_TRACKING_BRANCH }}
+            git reset --hard
+          fi
+          
+          # Reset the tracking branch to match Airbyte's latest state
+          git reset --hard airbyte/${{ env.SOURCE_BRANCH }}
+          
+          # Remove .github/workflows directory to prevent workflow conflicts
+          if [ -d ".github/workflows" ]; then
+            git rm -r --quiet --force .github/workflows/ || true
+            git commit -m "Exclude .github/workflows directory from sync" || true
+          fi
+          
+          # Push the updated tracking branch
+          git push origin ${{ env.AIRBYTE_TRACKING_BRANCH }} --force
+
+      - name: Create sync branch for PR
+        run: |
+          # Start a new branch from master for the PR
+          git checkout -b ${{ env.DESTINATION_BRANCH }} origin/master
+          
+          # Merge the Airbyte tracking branch (without fast-forward to maintain history)
+          git merge --no-ff ${{ env.AIRBYTE_TRACKING_BRANCH }} -m "Merge Airbyte changes from ${{ env.SOURCE_BRANCH }}"
+          
+          # Push the branch
           git push origin ${{ env.DESTINATION_BRANCH }} --force
 
       - name: Create Pull Request
-        if: env.REBASE_SUCCESS == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -159,7 +116,10 @@ jobs:
             const { repo, owner } = context.repo;
             const body = `This PR syncs changes from airbytehq/airbyte:${process.env.SOURCE_BRANCH} to this repository, preserving the commit history.
 
-            **Note**: This sync uses git rebase to maintain Airbyte's commit history.
+            **Note**: This sync maintains Airbyte's commit history in a separate branch (${process.env.AIRBYTE_TRACKING_BRANCH}) 
+            and then merges those changes into the main branch. This approach prevents duplicating commits 
+            and allows the repository to have its own commits without causing conflicts in future syncs.
+            
             The \`.github/workflows/\` directory has been excluded from this sync to prevent workflow permission issues.`;
 
             try {
@@ -177,10 +137,3 @@ jobs:
               console.error(`Failed to create PR: ${error.message}`);
               core.setFailed(`Failed to create PR: ${error.message}`);
             }
-
-      - name: Report Rebase Failure
-        if: env.REBASE_SUCCESS == 'false'
-        run: |
-          echo "Rebase failed with conflicts that couldn't be automatically resolved."
-          echo "You may need to perform the sync manually from Airbyte."
-          exit 1
