@@ -101,17 +101,17 @@ jobs:
               git status | grep "deleted in" | awk '{print $6}' | xargs -r git rm
               # Remove files with rename/delete conflicts
               git status | grep "renamed to" | grep "deleted in" | awk '{print $4}' | xargs -r git rm
-              # Remove any remaining conflicting files
-              git status | grep "both modified" | awk '{print $3}' | xargs -r git checkout --theirs
-              
+              # Remove any remaining conflicting files, except those in .github/workflows
+              git status | grep "both modified" | awk '{print $3}' | grep -v "\.github/workflows/" | xargs -r git checkout --theirs
+
               # Stage all changes
               git add .
               
               # Continue the rebase with an automatic commit message
               GIT_EDITOR=true git rebase --continue || true
             else
-              # For other conflicts, choose "theirs" strategy
-              git status | grep "both modified" | awk '{print $3}' | xargs -r git checkout --theirs
+              # For other conflicts, choose "theirs" strategy, except for .github/workflows
+              git status | grep "both modified" | awk '{print $3}' | grep -v "\.github/workflows/" | xargs -r git checkout --theirs
               git add .
               GIT_EDITOR=true git rebase --continue || true
             fi
@@ -139,13 +139,6 @@ jobs:
           if /tmp/rebase-script.sh; then
             echo "Rebase completed successfully."
             echo "REBASE_SUCCESS=true" >> $GITHUB_ENV
-            
-            # Remove .github/workflows directory from the synced content
-            echo "Removing .github/workflows directory from sync..."
-            if [ -d ".github/workflows" ]; then
-              git rm -r --cached .github/workflows/
-              git commit -m "Exclude .github/workflows directory from sync"
-            fi
           else
             echo "There are still unresolved conflicts after automatic fixes."
             echo "REBASE_SUCCESS=false" >> $GITHUB_ENV
