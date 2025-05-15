@@ -1,0 +1,193 @@
+name: Sync from Airbyte Repository with History
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Branch from Airbyte to sync (default: master)"
+        required: false
+        default: "master"
+        type: string
+      destination_branch:
+        description: "Branch name to create in this repository"
+        required: false
+        default: "airbyte-sync"
+        type: string
+      pr_title:
+        description: "Title for the Pull Request"
+        required: false
+        default: "Sync changes from Airbyte with history"
+        type: string
+
+  # # Optional: Schedule sync to run periodically
+  # schedule:
+  #   - cron: "0 0 * * 0" # Run weekly at midnight on Sunday
+  #     # Remove or modify this schedule as needed
+
+env:
+  # Fixed values for Airbyte repository
+  SOURCE_REPO: "airbytehq/airbyte"
+
+  # Default values for other parameters
+  DEFAULT_SOURCE_BRANCH: "master"
+  DEFAULT_DESTINATION_BRANCH: "airbyte-sync"
+  DEFAULT_PR_TITLE: "Weekly sync from Airbyte with history"
+
+jobs:
+  repo-sync:
+    name: Sync Repository with History
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set repository parameters
+        id: set-params
+        run: |
+          # Use input parameters or defaults based on trigger type
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "SOURCE_BRANCH=${{ github.event.inputs.source_branch || env.DEFAULT_SOURCE_BRANCH }}" >> $GITHUB_ENV
+            echo "DESTINATION_BRANCH=${{ github.event.inputs.destination_branch || env.DEFAULT_DESTINATION_BRANCH }}" >> $GITHUB_ENV
+            echo "PR_TITLE=${{ github.event.inputs.pr_title || env.DEFAULT_PR_TITLE }}" >> $GITHUB_ENV
+          else
+            echo "SOURCE_BRANCH=${{ env.DEFAULT_SOURCE_BRANCH }}" >> $GITHUB_ENV
+            echo "DESTINATION_BRANCH=airbyte-sync-$(date +%Y%m%d)" >> $GITHUB_ENV
+            echo "PR_TITLE=${{ env.DEFAULT_PR_TITLE }} - $(date +%Y-%m-%d)" >> $GITHUB_ENV
+          fi
+
+      - name: Check out destination repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          # Use GITHUB_TOKEN with the permissions defined at workflow level
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'romario-syniti'
+          git config --global user.email 'romario.silva@syniti.com'
+
+      - name: Create new branch for synced changes
+        run: |
+          # Create a new branch from current default branch
+          git checkout -b ${{ env.DESTINATION_BRANCH }}
+
+      - name: Add Airbyte repository as remote and rebase
+        id: rebase
+        run: |
+          # Configure git for non-interactive rebase
+          git config --global core.editor "true"
+
+          # Add Airbyte repository as remote
+          git remote add original https://github.com/${{ env.SOURCE_REPO }}.git
+
+          # Fetch source repository
+          git fetch original ${{ env.SOURCE_BRANCH }}
+
+          # Create a temporary script to handle the rebase process
+          cat > /tmp/rebase-script.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          # Start the rebase
+          git rebase original/$SOURCE_BRANCH -X theirs || true
+
+          # Check if we're in rebase mode
+          while git status | grep -q "You are currently rebasing"; do
+            # Handle conflicts due to deleted files
+            if git status | grep -q "deleted by\|deleted in"; then
+              # Remove files that were deleted in the source repo but modified in our repo
+              git status | grep "deleted by" | awk '{print $4}' | xargs -r git rm
+              # Remove files that were deleted in our repo but modified in the source repo
+              git status | grep "deleted in" | awk '{print $6}' | xargs -r git rm
+              # Remove files with rename/delete conflicts
+              git status | grep "renamed to" | grep "deleted in" | awk '{print $4}' | xargs -r git rm
+              # Remove any remaining conflicting files
+              git status | grep "both modified" | awk '{print $3}' | xargs -r git checkout --theirs
+              
+              # Stage all changes
+              git add .
+              
+              # Continue the rebase with an automatic commit message
+              GIT_EDITOR=true git rebase --continue || true
+            else
+              # For other conflicts, choose "theirs" strategy
+              git status | grep "both modified" | awk '{print $3}' | xargs -r git checkout --theirs
+              git add .
+              GIT_EDITOR=true git rebase --continue || true
+            fi
+            
+            # Check if rebase is still in progress
+            if ! git status | grep -q "You are currently rebasing"; then
+              break
+            fi
+          done
+
+          # Check final status
+          if git status | grep -q "You are currently rebasing"; then
+            echo "REBASE_SUCCESS=false" >> $GITHUB_ENV
+            exit 1
+          else
+            echo "REBASE_SUCCESS=true" >> $GITHUB_ENV
+            exit 0
+          fi
+          EOF
+
+          # Make the script executable
+          chmod +x /tmp/rebase-script.sh
+
+          # Run the rebase script
+          if /tmp/rebase-script.sh; then
+            echo "Rebase completed successfully."
+            echo "REBASE_SUCCESS=true" >> $GITHUB_ENV
+            
+            # Remove .github/workflows directory from the synced content
+            echo "Removing .github/workflows directory from sync..."
+            if [ -d ".github/workflows" ]; then
+              git rm -r --cached .github/workflows/
+              git commit -m "Exclude .github/workflows directory from sync"
+            fi
+          else
+            echo "There are still unresolved conflicts after automatic fixes."
+            echo "REBASE_SUCCESS=false" >> $GITHUB_ENV
+            git rebase --abort
+          fi
+
+      - name: Push changes
+        if: env.REBASE_SUCCESS == 'true'
+        run: |
+          git push origin ${{ env.DESTINATION_BRANCH }} --force
+
+      - name: Create Pull Request
+        if: env.REBASE_SUCCESS == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { repo, owner } = context.repo;
+            const body = `This PR syncs changes from airbytehq/airbyte:${process.env.SOURCE_BRANCH} to this repository, preserving the commit history.
+
+            **Note**: This sync uses git rebase to maintain Airbyte's commit history.
+            The \`.github/workflows/\` directory has been excluded from this sync to prevent workflow permission issues.`;
+
+            try {
+              const pr = await github.rest.pulls.create({
+                owner,
+                repo,
+                title: process.env.PR_TITLE,
+                head: process.env.DESTINATION_BRANCH,
+                base: 'master',  // Change this if your default branch is different
+                body: body
+              });
+              
+              console.log(`Pull request created: ${pr.data.html_url}`);
+            } catch (error) {
+              console.error(`Failed to create PR: ${error.message}`);
+              core.setFailed(`Failed to create PR: ${error.message}`);
+            }
+
+      - name: Report Rebase Failure
+        if: env.REBASE_SUCCESS == 'false'
+        run: |
+          echo "Rebase failed with conflicts that couldn't be automatically resolved."
+          echo "You may need to perform the sync manually from Airbyte."
+          exit 1
